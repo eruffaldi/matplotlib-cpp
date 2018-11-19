@@ -1,3 +1,9 @@
+/**
+ Original: https://github.com/lava/matplotlib-cpp
+ License: MIT License (plus matplotlib license PSF)
+
+ Modified by Emnauele Ruffaldi 2018
+ */
 #pragma once
 
 #include <vector>
@@ -62,6 +68,8 @@ struct _interpreter {
     PyObject *s_python_empty_tuple;
     PyObject *s_python_function_stem;
     PyObject *s_python_function_xkcd;
+    PyObject *s_python_function_imshow;
+    PyObject *s_python_function_scatter;
 
     /* For now, _interpreter is implemented as a singleton since its currently not possible to have
        multiple independent embedded python interpreters without patching the python source code
@@ -139,7 +147,7 @@ private:
         s_python_function_draw = PyObject_GetAttrString(pymod, "draw");
         s_python_function_pause = PyObject_GetAttrString(pymod, "pause");
         s_python_function_figure = PyObject_GetAttrString(pymod, "figure");
-        s_python_function_plot = PyObject_GetAttrString(pymod, "plot");
+        s_python_function_plot = PyObject_GetAttrString(pymod, "plot");       
         s_python_function_quiver = PyObject_GetAttrString(pymod, "quiver");
         s_python_function_semilogx = PyObject_GetAttrString(pymod, "semilogx");
         s_python_function_semilogy = PyObject_GetAttrString(pymod, "semilogy");
@@ -165,6 +173,8 @@ private:
         s_python_function_tight_layout = PyObject_GetAttrString(pymod, "tight_layout");
         s_python_function_stem = PyObject_GetAttrString(pymod, "stem");
         s_python_function_xkcd = PyObject_GetAttrString(pymod, "xkcd");
+        s_python_function_imshow = PyObject_GetAttrString(pymod, "imshow");
+        s_python_function_scatter = PyObject_GetAttrString(pymod, "scatter");
 
         if(    !s_python_function_show
             || !s_python_function_close
@@ -195,6 +205,8 @@ private:
             || !s_python_function_tight_layout
             || !s_python_function_stem
             || !s_python_function_xkcd
+            || !s_python_function_imshow
+            || !s_python_function_scatter
         ) { throw std::runtime_error("Couldn't find required function!"); }
 
         if (   !PyFunction_Check(s_python_function_show)
@@ -225,6 +237,8 @@ private:
             || !PyFunction_Check(s_python_function_errorbar)
             || !PyFunction_Check(s_python_function_stem)
             || !PyFunction_Check(s_python_function_xkcd)
+            || !PyFunction_Check(s_python_function_imshow)
+            || !PyFunction_Check(s_python_function_scatter)
         ) { throw std::runtime_error("Python object is unexpectedly not a PyFunction."); }
 
         s_python_empty_tuple = PyTuple_New(0);
@@ -301,6 +315,24 @@ PyObject* get_array(const std::vector<Numeric>& v)
     return varray;
 }
 
+template<typename Numeric>
+PyObject* get_array3(const Numeric * v, int m, int n, int c)
+{
+    detail::_interpreter::get();    //interpreter needs to be initialized for the numpy commands to work
+    NPY_TYPES type = select_npy_type<Numeric>::type;
+    npy_intp dims[3] = { m,n,c };
+    if (type == NPY_NOTYPE)
+    {
+        std::vector<double> vd((c == 0 ? 1 : c)*m*n);
+        std::copy(v,v+vd.size(),vd.begin());
+        return PyArray_SimpleNewFromData(c == 0 ? 2 : 3, dims, NPY_DOUBLE, (void*)(vd.data()));
+    }
+    else
+    {
+        return PyArray_SimpleNewFromData(c == 0 ? 2 : 3, dims, type, ptr);
+    }
+}
+
 #else // fallback if we don't have numpy: copy every element of the given vector
 
 template<typename Numeric>
@@ -312,6 +344,39 @@ PyObject* get_array(const std::vector<Numeric>& v)
     }
     return list;
 }
+
+template<typename Numeric>
+PyObject* get_array3(const Numeric * v, int m, int n, int c)
+{
+    PyObject* mlist = PyList_New(m);
+    if(c == 0)
+    {
+        for(size_t i = 0; i < m; ++i) {
+            PyObject* nlist = PyList_New(n);
+            for(size_t j = 0; j < n; ++j) {
+                    PyList_SetItem(nlist, j, PyFloat_FromDouble(*v++));
+            }
+            PyList_SetItem(mlist,i,nlist);
+        }
+    }
+    else
+    {
+        for(size_t i = 0; i < m; ++i) {
+            PyObject* nlist = PyList_New(n);
+            for(size_t j = 0; j < n; ++j) {
+                PyObject* clist = PyList_New(c);
+                for(size_t k = 0; k < c; ++k) {
+                    PyList_SetItem(clist, k, PyFloat_FromDouble(*v++));
+                }
+                PyList_SetItem(nlist,j,clist);
+            }
+            PyList_SetItem(mlist,i,nlist);
+        }
+
+    }
+    return mlist;
+}
+
 
 #endif // WITHOUT_NUMPY
 
@@ -340,6 +405,95 @@ bool plot(const std::vector<Numeric> &x, const std::vector<Numeric> &y, const st
 
     Py_DECREF(args);
     Py_DECREF(kwargs);
+    if(res) Py_DECREF(res);
+
+    return res;
+}
+
+template<typename Numeric>
+bool scatter(const std::vector<Numeric> &x, const std::vector<Numeric> &y, double s , const std::vector<Numeric> &c, std::string marker = "")
+{
+    assert(x.size() == y.size());
+
+    // using numpy arrays
+    PyObject* xarray = get_array(x);
+    PyObject* yarray = get_array(y);
+    PyObject* sarray = PyFloat_FromDouble(s);
+    PyObject* carray = c.empty() ? Py_None : get_array(c);
+
+    // construct positional args
+    PyObject* args = PyTuple_New(marker.empty() ? 4 : 5);
+    PyTuple_SetItem(args, 0, xarray);
+    PyTuple_SetItem(args, 1, yarray);
+    PyTuple_SetItem(args, 2, sarray);
+    PyTuple_SetItem(args, 3, carray);
+    if(!marker.empty())
+        PyTuple_SetItem(args, 4, PyString_FromString(marker.c_str()));
+
+    /*
+    // construct keyword args
+    PyObject* kwargs = PyDict_New();
+    for(std::map<std::string, std::string>::const_iterator it = keywords.begin(); it != keywords.end(); ++it)
+    {
+        PyDict_SetItemString(kwargs, it->first.c_str(), PyString_FromString(it->second.c_str()));
+    }
+    */
+
+    PyObject* res = PyObject_CallObject(detail::_interpreter::get().s_python_function_scatter, args);
+
+    Py_DECREF(args);
+    //Py_DECREF(kwargs);
+    if(res) Py_DECREF(res);
+
+    return res;
+}
+
+
+//  (n, m) or (n, m, 3) or (n, m, 4)
+template<typename Numeric>
+bool imshow(const Numeric *xy, int m, int n, int c, const std::map<std::string, std::string>& keywords)
+{
+
+    // using numpy arrays
+    PyObject* xyarray = get_array3(xy,m,n,c);
+
+    // construct positional args
+    PyObject* args = PyTuple_New(1);
+    PyTuple_SetItem(args, 0, xyarray);
+
+    // construct keyword args
+    PyObject* kwargs = PyDict_New();
+    for(std::map<std::string, std::string>::const_iterator it = keywords.begin(); it != keywords.end(); ++it)
+    {
+        PyDict_SetItemString(kwargs, it->first.c_str(), PyString_FromString(it->second.c_str()));
+    }
+
+    PyObject* res = PyObject_Call(detail::_interpreter::get().s_python_function_imshow, args, kwargs);
+
+    Py_DECREF(args);
+    Py_DECREF(kwargs);
+    if(res) Py_DECREF(res);
+
+    return res;
+}
+
+//  (n, m) or (n, m, 3) or (n, m, 4)
+template<typename Numeric>
+bool imshow(const Numeric *xy, int m, int n, int c, const std::string& s = "")
+{
+
+    // using numpy arrays
+    PyObject* xyarray = get_array3(xy,m,n,c);
+    PyObject* pystring = PyString_FromString(s.c_str());
+
+    // construct positional args
+    PyObject* args = PyTuple_New(2);
+    PyTuple_SetItem(args, 0, xyarray);
+    PyTuple_SetItem(args, 1, pystring);
+
+    PyObject* res = PyObject_CallObject(detail::_interpreter::get().s_python_function_imshow, args);
+
+    Py_DECREF(args);
     if(res) Py_DECREF(res);
 
     return res;
